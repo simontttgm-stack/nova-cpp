@@ -14,7 +14,7 @@
 #include <poll.h>
 
 struct ServerNode {
-    char ip[64];
+    char ip;
     int port;
     int latency_ms;
     bool is_alive;
@@ -28,12 +28,10 @@ void secure_zero_memory(void* ptr, size_t size) {
     }
 }
 
+// Проверка реального UDP/QUIC-канала для работы в мобильных сетях (4G/5G)
 int probe_endpoint(const char* ip, int port, int timeout_ms) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) return -1;
-
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -43,37 +41,37 @@ int probe_endpoint(const char* ip, int port, int timeout_ms) {
         return -1;
     }
 
-    auto start = std::chrono::steady_clock::now();
-    int res = connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    // Минимальный QUIC Initial-зонд для проверки прохождения UDP через DPI мобильного оператора
+    const unsigned char probe_packet = {
+        0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x01, 0x02,
+        0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00
+    };
 
-    if (res < 0 && errno != EINPROGRESS) {
+    auto start = std::chrono::steady_clock::now();
+    ssize_t sent = sendto(sock, probe_packet, sizeof(probe_packet), 0,
+                          reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (sent < 0) {
         close(sock);
         return -1;
     }
 
-    if (res != 0) {
-        pollfd pfd{};
-        pfd.fd = sock;
-        pfd.events = POLLOUT;
+    pollfd pfd{};
+    pfd.fd = sock;
+    pfd.events = POLLIN;
 
-        int poll_res = poll(&pfd, 1, timeout_ms);
-        if (poll_res <= 0) {
-            close(sock);
-            return -1;
-        }
-
-        int so_error = 0;
-        socklen_t len = sizeof(so_error);
-        getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
-        if (so_error != 0) {
-            close(sock);
-            return -1;
-        }
+    int poll_res = poll(&pfd, 1, timeout_ms);
+    if (poll_res <= 0) {
+        close(sock);
+        return -1;
     }
 
-    auto end = std::chrono::steady_clock::now();
+    unsigned char recv_buf;
+    ssize_t recvd = recvfrom(sock, recv_buf, sizeof(recv_buf), 0, nullptr, nullptr);
     close(sock);
 
+    if (recvd <= 0) return -1;
+
+    auto end = std::chrono::steady_clock::now();
     return static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()
     );
@@ -145,7 +143,7 @@ Java_com_example_nova_NativeScanner_scanAndPurgeBestServer(
         }
     }
 
-    char result_buf[96] = {0};
+    char result_buf = {0};
     if (best_idx != -1) {
         std::snprintf(result_buf, sizeof(result_buf), "%s:%d", nodes[best_idx].ip, nodes[best_idx].port);
     }
